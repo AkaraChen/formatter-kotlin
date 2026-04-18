@@ -1,24 +1,22 @@
-//! Run ktfmt's test corpus through formatter-kotlin to measure how much
-//! of the Kotlin language our formatter actually handles.
+//! Run ktfmt's test corpus through formatter-kotlin to measure how close we
+//! are to being a drop-in ktfmt replacement.
 //!
 //! ktfmt (https://github.com/facebook/ktfmt) is vendored as a git submodule at
 //! `third_party/ktfmt`. Its test suite (notably `FormatterTest.kt` and
-//! `GoogleStyleFormatterKtTest.kt`) contains ~1000 `assertFormatted(...)` calls
-//! where the string argument is both the input and the expected output of a
-//! ktfmt-idempotent format. That gives us a huge corpus of known-good,
-//! syntactically interesting Kotlin snippets to run through our formatter.
+//! `GoogleStyleFormatterKtTest.kt`) contains hundreds of `assertFormatted(s)`
+//! calls where `s` is both input *and* expected output — i.e. ktfmt is
+//! idempotent on `s`. That gives us a large corpus of known-good Kotlin where
+//! the ktfmt-correct answer is simply `s` itself.
 //!
-//! Since our goal is eventually to replace ktfmt, this test doesn't demand
-//! byte-for-byte output parity with ktfmt (ktfmt does column-aware wrapping,
-//! we do not). Instead, it measures syntactic coverage:
-//!   - `format()` returns Ok  → we parsed and formatted the snippet
-//!   - `format()` returns Err → the snippet breaks our pipeline
+//! Since the project's goal is to replace ktfmt, the bar here is output
+//! parity. Each snippet falls into one of three buckets:
+//!   - `parity`   — `format(s) == s`, i.e. we match ktfmt exactly
+//!   - `mismatch` — we formatted without error but produced different output
+//!   - `error`    — our pipeline refused the snippet outright
 //!
-//! The test emits a report to stderr with per-file and overall counts so it's
-//! easy to see at a glance what fraction of ktfmt's corpus we already support.
-//! It asserts only that we extracted some snippets and that at least one runs
-//! through cleanly — concrete pass rates aren't gated, so the number can grow
-//! as the formatter improves without churning this file.
+//! The test asserts only that we extracted some snippets and that at least
+//! one reaches parity. Concrete pass rates aren't gated, so the numbers can
+//! grow as the formatter improves without churning this file.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -36,6 +34,12 @@ fn ktfmt_format_test_dir() -> PathBuf {
 ///   1. `assertFormatted("literal\n")` — simple single-string argument.
 ///   2. `assertFormatted("""<body>""".trimMargin())` — the dominant pattern;
 ///      each body line is prefixed with `|` after the indentation.
+///
+/// The ktfmt test suite defines `private const val TQ = "\"\"\""` and splices
+/// it into snippets via the Kotlin string-template forms `$TQ` / `${TQ}` so
+/// each snippet can itself contain a triple-quoted string. We evaluate that
+/// splice here — the compiler would do it at runtime, and without it the
+/// snippet isn't valid Kotlin.
 ///
 /// When `deduceMaxWidth = true` is passed, the first line of the snippet is a
 /// row of `/` or `-` characters that encodes the desired wrap column — it
@@ -69,6 +73,7 @@ fn extract_snippets(src: &str) -> Vec<String> {
                     raw.to_owned()
                 };
                 let snippet = strip_width_marker_line(&snippet);
+                let snippet = expand_tq_templates(&snippet);
                 if !snippet.trim().is_empty() {
                     out.push(snippet);
                 }
@@ -78,10 +83,37 @@ fn extract_snippets(src: &str) -> Vec<String> {
         } else if src[body_start..].starts_with('"') {
             let open = body_start + 1;
             if let Some(lit) = parse_kotlin_string_literal(&src[open..]) {
+                let lit = expand_tq_templates(&lit);
                 if !lit.trim().is_empty() {
                     out.push(lit);
                 }
             }
+        }
+    }
+    out
+}
+
+/// Evaluate the `$TQ` / `${TQ}` Kotlin string-template references used by
+/// ktfmt's test fixtures. `TQ` is always the literal `"""`; `\$` stays a
+/// literal dollar sign and is left alone.
+fn expand_tq_templates(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < s.len() {
+        let rest = &s[i..];
+        if rest.starts_with("\\$") {
+            out.push_str("\\$");
+            i += 2;
+        } else if rest.starts_with("${TQ}") {
+            out.push_str("\"\"\"");
+            i += "${TQ}".len();
+        } else if rest.starts_with("$TQ") {
+            out.push_str("\"\"\"");
+            i += "$TQ".len();
+        } else {
+            let c = rest.chars().next().unwrap();
+            out.push(c);
+            i += c.len_utf8();
         }
     }
     out
@@ -149,36 +181,51 @@ fn parse_kotlin_string_literal(src: &str) -> Option<String> {
     None
 }
 
-#[derive(Default)]
+#[derive(Default, Clone, Copy)]
 struct Stats {
     total: usize,
-    ok: usize,
-    err: usize,
+    /// `format(s) == s` — exact parity with ktfmt on this snippet.
+    parity: usize,
+    /// Formatter produced output, but it differs from ktfmt's.
+    mismatch: usize,
+    /// Formatter refused the snippet.
+    error: usize,
 }
 
 impl Stats {
-    fn record(&mut self, result: Result<String, impl std::fmt::Display>) -> bool {
+    fn record(&mut self, outcome: Outcome) {
         self.total += 1;
-        match result {
-            Ok(_) => {
-                self.ok += 1;
-                true
-            }
-            Err(_) => {
-                self.err += 1;
-                false
-            }
+        match outcome {
+            Outcome::Parity => self.parity += 1,
+            Outcome::Mismatch => self.mismatch += 1,
+            Outcome::Error => self.error += 1,
         }
+    }
+
+    /// Parses cleanly — parity or mismatch, i.e. not an error.
+    fn parse_ok(&self) -> usize {
+        self.parity + self.mismatch
     }
 }
 
-fn run_one(snippet: &str) -> Result<String, formatter_kotlin::FormatError> {
+#[derive(Clone, Copy)]
+enum Outcome {
+    Parity,
+    Mismatch,
+    Error,
+}
+
+fn run_one(snippet: &str) -> Outcome {
     let opts = FormatOptions {
         indent: "  ".to_owned(), // ktfmt uses 2-space indent
         skip_idempotence: true,
         tolerate_parsing_errors: false,
     };
-    format_with(snippet, &opts)
+    match format_with(snippet, &opts) {
+        Ok(out) if out == snippet => Outcome::Parity,
+        Ok(_) => Outcome::Mismatch,
+        Err(_) => Outcome::Error,
+    }
 }
 
 #[test]
@@ -192,8 +239,9 @@ fn ktfmt_corpus_coverage() {
     }
 
     let mut overall = Stats::default();
-    let mut first_failure: Option<(PathBuf, String, String)> = None;
-    let mut file_reports: Vec<(String, Stats, Vec<String>)> = Vec::new();
+    let mut first_error: Option<(PathBuf, String, String)> = None;
+    let mut first_mismatch: Option<(PathBuf, String, String)> = None;
+    let mut file_reports: Vec<(String, Stats)> = Vec::new();
 
     let mut paths: Vec<PathBuf> = fs::read_dir(&dir)
         .expect("read ktfmt format test dir")
@@ -206,60 +254,82 @@ fn ktfmt_corpus_coverage() {
         let src = fs::read_to_string(&path).expect("read ktfmt test file");
         let snippets = extract_snippets(&src);
         let mut file_stats = Stats::default();
-        let mut failing_samples: Vec<String> = Vec::new();
         for snippet in &snippets {
-            let result = run_one(snippet);
-            let ok = file_stats.record(result.as_ref().map(|s| s.clone()));
-            if !ok {
-                if failing_samples.len() < 3 {
-                    let preview = snippet.lines().take(4).collect::<Vec<_>>().join("\n");
-                    failing_samples.push(preview);
+            let outcome = run_one(snippet);
+            file_stats.record(outcome);
+            match outcome {
+                Outcome::Error if first_error.is_none() => {
+                    let opts = FormatOptions {
+                        indent: "  ".to_owned(),
+                        skip_idempotence: true,
+                        tolerate_parsing_errors: false,
+                    };
+                    let err = format_with(snippet, &opts).unwrap_err().to_string();
+                    first_error = Some((path.clone(), snippet.clone(), err));
                 }
-                if first_failure.is_none() {
-                    let err = run_one(snippet).unwrap_err().to_string();
-                    first_failure = Some((path.clone(), snippet.clone(), err));
+                Outcome::Mismatch if first_mismatch.is_none() => {
+                    let opts = FormatOptions {
+                        indent: "  ".to_owned(),
+                        skip_idempotence: true,
+                        tolerate_parsing_errors: false,
+                    };
+                    let out = format_with(snippet, &opts).unwrap();
+                    first_mismatch = Some((path.clone(), snippet.clone(), out));
                 }
+                _ => {}
             }
         }
         overall.total += file_stats.total;
-        overall.ok += file_stats.ok;
-        overall.err += file_stats.err;
-        file_reports.push((
-            filename_or_path(&path),
-            file_stats,
-            failing_samples,
-        ));
+        overall.parity += file_stats.parity;
+        overall.mismatch += file_stats.mismatch;
+        overall.error += file_stats.error;
+        file_reports.push((filename_or_path(&path), file_stats));
     }
 
     eprintln!();
-    eprintln!("=== ktfmt corpus coverage ===");
-    for (name, s, _) in &file_reports {
-        let pct = if s.total == 0 {
-            0.0
-        } else {
-            100.0 * (s.ok as f64) / (s.total as f64)
-        };
+    eprintln!("=== ktfmt corpus parity ===");
+    eprintln!(
+        "  {:<40} {:>5}  {:>5}  {:>5}  {:>5}  {:>7}",
+        "file", "total", "par", "mism", "err", "par%"
+    );
+    for (name, s) in &file_reports {
+        let pct = percent(s.parity, s.total);
         eprintln!(
-            "  {:<40} {:>4}/{:<4} ok  ({:5.1}%)",
-            name, s.ok, s.total, pct
+            "  {:<40} {:>5}  {:>5}  {:>5}  {:>5}  {:>6.1}%",
+            name, s.total, s.parity, s.mismatch, s.error, pct
         );
     }
-    let pct = if overall.total == 0 {
-        0.0
-    } else {
-        100.0 * (overall.ok as f64) / (overall.total as f64)
-    };
+    let pct = percent(overall.parity, overall.total);
+    let parse_pct = percent(overall.parse_ok(), overall.total);
     eprintln!(
-        "  {:-<40} {:>4}/{:<4} ok  ({:5.1}%)",
-        "total ", overall.ok, overall.total, pct
+        "  {:-<40} {:>5}  {:>5}  {:>5}  {:>5}  {:>6.1}%",
+        "total ", overall.total, overall.parity, overall.mismatch, overall.error, pct
+    );
+    eprintln!(
+        "  (parse-ok = parity + mismatch = {}/{} = {:.1}%)",
+        overall.parse_ok(),
+        overall.total,
+        parse_pct,
     );
 
-    if let Some((path, snippet, err)) = &first_failure {
+    if let Some((path, snippet, err)) = &first_error {
         eprintln!();
-        eprintln!("first failing snippet comes from {}:", filename_or_path(path));
+        eprintln!("first erroring snippet comes from {}:", filename_or_path(path));
         eprintln!("  error: {err}");
         eprintln!("  snippet (first 6 lines):");
         for line in snippet.lines().take(6) {
+            eprintln!("  | {line}");
+        }
+    }
+    if let Some((path, snippet, out)) = &first_mismatch {
+        eprintln!();
+        eprintln!("first mismatching snippet comes from {}:", filename_or_path(path));
+        eprintln!("  input (first 6 lines):");
+        for line in snippet.lines().take(6) {
+            eprintln!("  | {line}");
+        }
+        eprintln!("  our output (first 6 lines):");
+        for line in out.lines().take(6) {
             eprintln!("  | {line}");
         }
     }
@@ -269,9 +339,13 @@ fn ktfmt_corpus_coverage() {
         "extracted no snippets from ktfmt corpus — extractor is broken"
     );
     assert!(
-        overall.ok > 0,
-        "not a single ktfmt snippet made it through our formatter"
+        overall.parity > 0,
+        "not a single ktfmt snippet reached output parity with our formatter"
     );
+}
+
+fn percent(n: usize, d: usize) -> f64 {
+    if d == 0 { 0.0 } else { 100.0 * (n as f64) / (d as f64) }
 }
 
 fn filename_or_path(p: &Path) -> String {
