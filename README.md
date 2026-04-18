@@ -64,12 +64,12 @@ There are unit tests in `src/lib.rs` (query-compilation, trivial inputs) and
 26 integration tests in `tests/format.rs` covering every formatting construct
 listed above. Each integration test checks both correctness and idempotence.
 
-### ktfmt corpus coverage
+### ktfmt corpus parity
 
 This project's long-term goal is to fully replace
 [ktfmt](https://github.com/facebook/ktfmt), so ktfmt is vendored as a git
-submodule at `third_party/ktfmt` and its test suite is reused as a Kotlin
-language-coverage benchmark:
+submodule at `third_party/ktfmt` and its test suite is reused as a real
+parity benchmark:
 
 ```
 git submodule update --init --recursive
@@ -77,11 +77,18 @@ cargo test --test ktfmt_corpus -- --nocapture
 ```
 
 `tests/ktfmt_corpus.rs` scans ktfmt's JUnit tests for every
-`assertFormatted(...)` snippet (~425 snippets across `FormatterTest.kt` and
-`GoogleStyleFormatterKtTest.kt`), runs each one through `format_with`, and
-prints a per-file and total pass rate to stderr. A snippet counts as "ok"
-when our pipeline parses and formats it without error — output parity with
-ktfmt is not required because ktfmt does column-aware wrapping and we do not.
-The test only asserts that the corpus is non-empty and at least one snippet
-runs through cleanly; concrete pass rates are reported, not gated, so the
-number can climb as the formatter improves without churning the test.
+`assertFormatted(s)` snippet (~425 snippets across `FormatterTest.kt` and
+`GoogleStyleFormatterKtTest.kt`) and classifies each one into three buckets:
+
+- `parity`   — `format(s) == s`, i.e. we agree with ktfmt exactly
+- `mismatch` — we formatted without error but produced different output
+- `error`    — our pipeline refused the snippet outright
+
+Because `assertFormatted` is an idempotence assertion in ktfmt's own suite,
+a snippet reaches parity only when our formatter reproduces it byte-for-byte.
+That's the honest bar for being a drop-in replacement. The test asserts only
+that the corpus is non-empty and that at least one snippet reaches parity;
+concrete numbers are reported to stderr, not gated, so they can climb as the
+formatter improves without churning the test. A `parse-ok` count
+(`parity + mismatch`) is also printed to make the error/mismatch split easy
+to see at a glance.
